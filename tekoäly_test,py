@@ -1,0 +1,197 @@
+from datetime import datetime, timedelta, timezone
+import os
+import time
+import requests
+import pandas as pd
+from lightgbm import LGBMRegressor
+from sklearn.metrics import mean_absolute_error
+
+API_KEY = "e3f8f3a153b447c9b44f8037962bc9f8"
+DATASET_TOTEUTUNUT = 124  # Suomen sähkönkulutus (toteutunut, MW)
+DATASET_ENNUSTE = 192     # Fingridin oma sähkönkulutusennuste (MW)
+CACHE_FILE = "fingrid_cache.csv"
+CACHE_MAX_AGE_HOURS = 1  # Välimuistin vanhenemisaika tunteina
+
+# Määritetään aikaväli (viimeiset 14 päivää)
+nyt_utc = datetime.now(timezone.utc)
+alku_utc = nyt_utc - timedelta(days=14)
+
+start_str = alku_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
+end_str = nyt_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+headers = {
+    "x-api-key": API_KEY,
+    "Accept": "application/json"
+}
+
+def hae_fingrid_data(dataset_id):
+    """Haetaan data Fingridistä sivutuksella."""
+    url = f"https://data.fingrid.fi/api/datasets/{dataset_id}/data"
+    kaikki_data = []
+    page = 1
+    
+    while True:
+        params = {
+            "startTime": start_str,
+            "endTime": end_str,
+            "pageSize": 1000,
+            "page": page
+        }
+        
+        try:
+            response = requests.get(url, headers=headers, params=params, timeout=10)
+            
+            if response.status_code == 429:
+                print(" Odotetaan 3 sekuntia (API-rajoitus hit)...")
+                time.sleep(3)
+                continue
+                
+            response.raise_for_status()
+            
+            json_data = response.json()
+            sivun_data = json_data.get("data", [])
+            
+            if not sivun_data:
+                break
+                
+            kaikki_data.extend(sivun_data)
+            
+            pagination = json_data.get("pagination", {})
+            if page >= pagination.get("lastPage", 1):
+                break
+                
+            page += 1
+            time.sleep(0.3)
+
+        except Exception as e:
+            print(f"\n Virhe datan haussa (Dataset {dataset_id}): {e}")
+            break
+            
+    if not kaikki_data:
+        return pd.DataFrame()
+        
+    df = pd.DataFrame(kaikki_data)
+    df["startTime"] = pd.to_datetime(df["startTime"])
+    df["aika_fi"] = df["startTime"].dt.tz_convert("Europe/Helsinki")
+    df = df.sort_values("aika_fi").reset_index(drop=True)
+    return df[["aika_fi", "value"]]
+
+def hae_yhdistetty_data_cachella():
+    """Tarkistaa löytyykö kelvollinen välimuisti levyltä, muuten hakee APIsta."""
+    if os.path.exists(CACHE_FILE):
+        file_mod_time = datetime.fromtimestamp(os.path.getmtime(CACHE_FILE), tz=timezone.utc)
+        age = nyt_utc - file_mod_time
+        
+        if age < timedelta(hours=CACHE_MAX_AGE_HOURS):
+            print(f" Ladataan data paikallisesta välimuistista ('{CACHE_FILE}')...")
+            df = pd.read_csv(CACHE_FILE)
+            # Muunnetaan merkkijono Aikavyöhykkeelliseksi datetime-olioksi (Europe/Helsinki)
+            df["aika_fi"] = pd.to_datetime(df["aika_fi"], utc=True).dt.tz_convert("Europe/Helsinki")
+            return df
+
+    print(" Välimuistia ei löydy tai se on vanhentunut. Haetaan data Fingridistä...")
+    
+    print("1/2 Haetaan toteutunut kulutus (124)...")
+    df_toteutunut = hae_fingrid_data(DATASET_TOTEUTUNUT)
+
+    time.sleep(1.5)
+
+    print("2/2 Haetaan Fingridin ennuste (192)...")
+    df_fingrid_ennuste = hae_fingrid_data(DATASET_ENNUSTE)
+
+    if df_toteutunut.empty or df_fingrid_ennuste.empty:
+        return pd.DataFrame()
+
+    df = pd.merge_asof(
+        df_toteutunut.rename(columns={"value": "toteutunut_MW"}),
+        df_fingrid_ennuste.rename(columns={"value": "fingrid_ennuste_MW"}),
+        on="aika_fi",
+        direction="nearest"
+    ).dropna()
+
+    # Tallennetaan välimuistiin
+    df.to_csv(CACHE_FILE, index=False)
+    print(f" Data tallennettu välimuistiin: '{CACHE_FILE}'")
+    return df
+
+# --- PÄÄOHJELMA ---
+df = hae_yhdistetty_data_cachella()
+
+if df.empty:
+    print("\n Datan haku ei onnistunut. Yritä hetken kuluttua uudelleen.")
+else:
+    # Luodaan piirteet
+    df["tunti"] = df["aika_fi"].dt.hour
+    df["viikonpaiva"] = df["aika_fi"].dt.dayofweek
+    df["kuukausi"] = df["aika_fi"].dt.month
+    df["lag_1h"] = df["toteutunut_MW"].shift(1)
+    df["lag_24h"] = df["toteutunut_MW"].shift(24)
+
+    df_clean = df.dropna().copy()
+
+    features = ["tunti", "viikonpaiva", "kuukausi", "lag_1h", "lag_24h"]
+    X = df_clean[features]
+    y = df_clean["toteutunut_MW"]
+
+    # Koulutus- ja testijako
+    split_idx = int(len(df_clean) * 0.8)
+    X_train, X_test = X.iloc[:split_idx], X.iloc[split_idx:]
+    y_train, y_test = y.iloc[:split_idx], y.iloc[split_idx:]
+
+    malli = LGBMRegressor(n_estimators=100, learning_rate=0.05, random_state=42, verbosity=-1)
+    malli.fit(X_train, y_train)
+
+    test_ennusteet = malli.predict(X_test)
+    mae = mean_absolute_error(y_test, test_ennusteet)
+
+    viimeisin_rivi = df_clean.iloc[-1]
+    nykyinen_aika = viimeisin_rivi["aika_fi"].strftime("%d.%m.%Y %H:%M")
+
+    toteutunut_nykyhetki = viimeisin_rivi["toteutunut_MW"]
+    fingrid_ennuste_nykyhetki = viimeisin_rivi["fingrid_ennuste_MW"]
+
+    uusi_syote = pd.DataFrame([viimeisin_rivi[features].to_dict()])
+    oma_lgbm_ennuste = malli.predict(uusi_syote)[0]
+
+    # --- SÄILYTETYT TULOSTEET ---
+    print("\n" + "="*50)
+    print(f"SÄHKÖNKULUTUSENNUSTE AJANKOHDALLE: {nykyinen_aika}")
+    print("="*50)
+    print(f"1. Toteutunut kulutus (Fingrid): {toteutunut_nykyhetki:.2f} MW")
+    print(f"2. Sinun LightGBM-ennusteesi:     {oma_lgbm_ennuste:.2f} MW")
+    print(f"3. Fingridin virallinen ennuste: {fingrid_ennuste_nykyhetki:.2f} MW")
+    print("-" * 50)
+    print(f"Sinun mallisi virhe tässä pisteessä:  {abs(toteutunut_nykyhetki - oma_lgbm_ennuste):.2f} MW")
+    print(f"Fingridin ennusteen virhe pisteessä: {abs(toteutunut_nykyhetki - fingrid_ennuste_nykyhetki):.2f} MW")
+    print(f"\nMallisi keskimääräinen virhe (MAE testijoukossa): {mae:.2f} MW")
+    print("="*50)
+
+    # --- ENNUSTE 24 TUNNILLE ETEENPÄIN ---
+    viimeisin_aika = viimeisin_rivi["aika_fi"]
+    nykyinen_lag1 = toteutunut_nykyhetki
+
+    print("\n" + "="*50)
+    print(f"ENNUSTE SEURAAVALLE 24 TUNNILLE (Alkaen {viimeisin_aika.strftime('%d.%m.%Y %H:%M')})")
+    print("="*50)
+
+    for i in range(1, 25):
+        tuleva_aika = viimeisin_aika + timedelta(hours=i)
+        
+        # Haetaan lag_24h historiasta
+        lag_24h_arvo = df_clean[df_clean["aika_fi"] == (tuleva_aika - timedelta(hours=24))]["toteutunut_MW"]
+        lag_24h_val = lag_24h_arvo.values[0] if not lag_24h_arvo.empty else nykyinen_lag1
+        
+        syote = pd.DataFrame([{
+            "tunti": tuleva_aika.hour,
+            "viikonpaiva": tuleva_aika.dayofweek,
+            "kuukausi": tuleva_aika.month,
+            "lag_1h": nykyinen_lag1,
+            "lag_24h": lag_24h_val
+        }])
+        
+        ennustettu_mw = malli.predict(syote)[0]
+        nykyinen_lag1 = ennustettu_mw
+        
+        print(f"{tuleva_aika.strftime('%d.%m. %H:%M')}  -->  {ennustettu_mw:.2f} MW")
+
+    print("="*50)
