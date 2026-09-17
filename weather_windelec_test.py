@@ -1,10 +1,10 @@
-from datetime import datetime, timedelta, timezone
 import os
 import time
 import requests
 import pandas as pd
 import numpy as np
-from lightgbm import LGBMRegressor
+from datetime import datetime, timedelta, timezone
+from sklearn.ensemble import HistGradientBoostingRegressor
 from sklearn.metrics import mean_absolute_error
 
 API_KEY_FINGRID = "e3f8f3a153b447c9b44f8037962bc9f8"
@@ -24,12 +24,13 @@ TUULIPUISTO_LOKAATIOT = {
 }
 
 CACHE_FILE = "tuulivoima_60d_cache.csv"
+OUTPUT_FILE = "output_wind_mw_predic.csv"
 CACHE_MAX_AGE_HOURS = 1  # Välimuisti voimassa 1 tunnin
 
 nyt_utc = datetime.now(timezone.utc)
-# Haetaan 60 päivää historiaa opetusjoukkoon paremman tarkkuuden saamiseksi
+# Haetaan 60 päivää historiaa opetusjoukkoon ja ennustetaan 5 päivää eteenpäin
 alku_historia_utc = nyt_utc - timedelta(days=60)
-loppu_ennuste_utc = nyt_utc + timedelta(days=2)
+loppu_ennuste_utc = nyt_utc + timedelta(days=5)
 
 # --- 1. DATAN HAKU: FINGRID ---
 def hae_fingrid_dataset(dataset_id, nimi):
@@ -76,7 +77,7 @@ def hae_fingrid_dataset(dataset_id, nimi):
 # --- 2. DATAN HAKU: OPEN-METEO (100m Tuuli) ---
 def hae_open_meteo_saa():
     """Hakee sääennusteen 100m korkeudelta 6 eri tuulivoima-alueelta."""
-    print(" Haetaan sääennusteet (100m tuulennopeus) Open-Meteo APIsta...")
+    print("Haetaan sääennusteet (100m tuulennopeus) Open-Meteo APIsta...")
     start_date = alku_historia_utc.strftime("%Y-%m-%d")
     end_date = loppu_ennuste_utc.strftime("%Y-%m-%d")
     
@@ -108,7 +109,7 @@ def hae_open_meteo_saa():
             })
             alue_data.append(df_alue)
         except Exception as e:
-            print(f" Virhe Open-Meteo haussa paikkakunnalle {alue}: {e}")
+            print(f"Virhe Open-Meteo haussa paikkakunnalle {alue}: {e}")
             
     if not alue_data:
         return pd.DataFrame()
@@ -117,14 +118,11 @@ def hae_open_meteo_saa():
     for df_seuraava in alue_data[1:]:
         df_saa = pd.merge(df_saa, df_seuraava, on="aika_fi", how="outer")
         
-    # Keskiarvoparametrit Suomen yli
     tuulisarakkeet = [c for c in df_saa.columns if c.startswith("tuuli100m_")]
     puuskasarakkeet = [c for c in df_saa.columns if c.startswith("puuska_")]
     
     df_saa["tuulinopeus_100m_ka_ms"] = df_saa[tuulisarakkeet].mean(axis=1)
     df_saa["puuska_ka_ms"] = df_saa[puuskasarakkeet].mean(axis=1)
-    
-    # Fysiikkapiirre: Tuulen teho kasvaa kuutiossa (v^3)
     df_saa["tuuliteho_indeksi"] = df_saa["tuulinopeus_100m_ka_ms"] ** 3
     
     return df_saa
@@ -135,12 +133,12 @@ def hae_yhdistetty_data():
     if os.path.exists(CACHE_FILE):
         file_mod_time = datetime.fromtimestamp(os.path.getmtime(CACHE_FILE), tz=timezone.utc)
         if (nyt_utc - file_mod_time) < timedelta(hours=CACHE_MAX_AGE_HOURS):
-            print(f" Ladataan data välimuistista ('{CACHE_FILE}')...")
+            print(f"Ladataan data välimuistista ('{CACHE_FILE}')...")
             df = pd.read_csv(CACHE_FILE)
             df["aika_fi"] = pd.to_datetime(df["aika_fi"], utc=True).dt.tz_convert("Europe/Helsinki")
             return df
 
-    print(" Välimuisti vanhentunut tai puuttuu. Haetaan uusi data verkosta...")
+    print("Välimuisti vanhentunut tai puuttuu. Haetaan uusi data verkosta...")
     print("1/3 Haetaan toteutuneet tuulivoimatiedot ja Fingrid-ennusteet...")
     df_toteutunut = hae_fingrid_dataset(DATASET_TUULIVOIMA_TOTEUTUNUT, "tuulivoima_toteutunut_MW")
     df_fingrid_ennuste = hae_fingrid_dataset(DATASET_TUULIVOIMA_ENNUSTE, "fingrid_ennuste_MW")
@@ -149,30 +147,26 @@ def hae_yhdistetty_data():
     df_saa = hae_open_meteo_saa()
 
     if df_saa.empty or df_toteutunut.empty:
-        print(" Datan haku epäonnistui.")
+        print("Datan haku epäonnistui.")
         return pd.DataFrame()
 
-    # Yhdistetään kaikki tiedot
     df_all = pd.merge(df_saa, df_toteutunut, on="aika_fi", how="left")
     df_all = pd.merge(df_all, df_fingrid_ennuste, on="aika_fi", how="left")
 
-    # Tallennetaan välimuistiin
     df_all.to_csv(CACHE_FILE, index=False)
-    print(f" Data tallennettu välimuistiin: '{CACHE_FILE}'")
+    print(f"Data tallennettu välimuistiin: '{CACHE_FILE}'")
     return df_all
 
 # --- 4. PÄÄOHJELMA JA ENNUSTEMALLI ---
 df_all = hae_yhdistetty_data()
 
 if df_all.empty:
-    print(" Ei dataa käsiteltäväksi.")
+    print("Ei dataa käsiteltäväksi.")
 else:
-    # --- VIIVE-PIIRRE (LAG) JA AIKAPIIRTEET ---
     df_all["lag_1h_tuulivoima"] = df_all["tuulivoima_toteutunut_MW"].shift(1)
     df_all["tunti"] = df_all["aika_fi"].dt.hour
     df_all["viikonpaiva"] = df_all["aika_fi"].dt.dayofweek
 
-    # Sarakkeet Open-Meteen tuulille
     tuuli_aluesarakkeet = [c for c in df_all.columns if c.startswith("tuuli100m_")]
 
     features = [
@@ -184,35 +178,34 @@ else:
         "viikonpaiva"
     ] + tuuli_aluesarakkeet
 
-    # Opetusjoukko
     df_train = df_all.dropna(subset=["tuulivoima_toteutunut_MW"] + features).copy()
 
     X = df_train[features]
     y = df_train["tuulivoima_toteutunut_MW"]
 
-    # Koulutetaan LightGBM-malli
     split_idx = int(len(df_train) * 0.8)
     X_train, X_val = X.iloc[:split_idx], X.iloc[split_idx:]
     y_train, y_val = y.iloc[:split_idx], y.iloc[split_idx:]
 
-    malli = LGBMRegressor(
-        n_estimators=200, 
+    malli = HistGradientBoostingRegressor(
+        max_iter=200, 
         learning_rate=0.03, 
         max_depth=6, 
-        random_state=42, 
-        verbosity=-1
+        random_state=42
     )
     malli.fit(X_train, y_train)
 
-    # Validaatio-virhe
     val_ennusteet = malli.predict(X_val)
     mae = mean_absolute_error(y_val, val_ennusteet)
 
-    # --- 5. RULLAAVA ENNUSTAMINEN TULEVAISUUTEEN (Recursive Forecast) ---
+    # --- 5. RULLAAVA ENNUSTAMINEN TULEVAISUUTEEN (5 PÄIVÄÄ / 120 TUNTIA) ---
     df_future = df_all[df_all["aika_fi"] >= nyt_utc.astimezone()].copy().reset_index(drop=True)
+    
+    # Ennustetaan seuraavat 5 päivää (120 tuntia)
+    df_future = df_future.head(96).copy()
 
     ennusteet = []
-    edellinen_tuotanto = df_train.iloc[-1]["tuulivoima_toteutunut_MW"]  # Viimeisin toteutuma
+    edellinen_tuotanto = df_train.iloc[-1]["tuulivoima_toteutunut_MW"]
 
     for i in range(len(df_future)):
         rivi = df_future.iloc[[i]].copy()
@@ -221,21 +214,32 @@ else:
         ennustettu_mw = malli.predict(rivi[features])[0]
         ennusteet.append(ennustettu_mw)
         
-        # Seuraavalle tunnille rullataan juuri ennustettu arvo
         edellinen_tuotanto = ennustettu_mw
 
     df_future["oma_lgbm_ennuste_MW"] = ennusteet
 
-    # --- TULOSTUS ---
+    # --- 6. TALLENNUS CSV-TIEDOSTOON ---
+    output_cols = [
+        "aika_fi", 
+        "oma_lgbm_ennuste_MW", 
+        "fingrid_ennuste_MW", 
+        "tuulinopeus_100m_ka_ms"
+    ]
+    
+    df_output = df_future[[col for col in output_cols if col in df_future.columns]].copy()
+    df_output.to_csv(OUTPUT_FILE, index=False)
+    print(f"\nEnnusteet seuraavalle 5 päivälle tallennettu tiedostoon: {OUTPUT_FILE}")
+
+    # --- TULOSTUS (Ensimmäiset 24h) ---
     print("\n" + "="*80)
-    print(f" TUULIVOIMAENNUSTE SEURAAVILLE 24 TUNNILLE (Oma LGBM vs Fingrid)")
+    print(" TUULIVOIMAENNUSTE (Oma LGBM vs Fingrid) - Ensimmäiset 24h")
     print("="*80)
     print(f"Mallin keskimääräinen virhe opetusdatassa (MAE): {mae:.2f} MW\n")
 
     print(f"{'Aika':<14} | {'Tuuli 100m':<11} | {'Oma LGBM Ennuste':<18} | {'Fingrid Ennuste':<16}")
     print("-" * 80)
 
-    for _, row in df_future.head(24).iterrows():
+    for _, row in df_future.head(48).iterrows():
         aika_str = row["aika_fi"].strftime("%d.%m %H:%M")
         tuuli = f"{row['tuulinopeus_100m_ka_ms']:.1f} m/s"
         oma_ennuste = f"{row['oma_lgbm_ennuste_MW']:.0f} MW"
@@ -244,5 +248,3 @@ else:
         print(f"{aika_str:<14} | {tuuli:<11} | {oma_ennuste:<18} | {fingrid_ennuste:<16}")
 
     print("="*80)
-
-

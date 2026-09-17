@@ -3,16 +3,31 @@ import os
 import time
 import requests
 import pandas as pd
+import numpy as np
 from lightgbm import LGBMRegressor
-from sklearn.metrics import mean_absolute_error
 
+# --- 1. ASETUKSET & DATASET ID:T ---
 API_KEY = "e3f8f3a153b447c9b44f8037962bc9f8"
-DATASET_TOTEUTUNUT = 124  # Suomen sähkönkulutus (toteutunut, MW)
-DATASET_ENNUSTE = 192     # Fingridin oma sähkönkulutusennuste (MW)
-CACHE_FILE = "fingrid_cache.csv"
-CACHE_MAX_AGE_HOURS = 1  # Välimuistin vanhenemisaika tunteina
+TUULIENNUSTE_TIEDOSTO = "output_wind_mw_predic.csv"
 
-# Määritetään aikaväli (viimeiset 14 päivää)
+DATASETS = {
+    "tuulivoima_toteutunut": 181,
+    "tuulivoima_ennuste": 268,
+    "aurinkovoima_ennuste": 248,
+    "vesivoima_toteutunut": 191,
+    "kulutus_toteutunut": 124,
+    "kulutus_ennuste": 192,
+    "ydinvoima_toteutunut": 188,
+    "yhteistuotanto_chp": 201,
+    "teholauhdutus_varavoima": 202,
+    "siirto_ruotsi_se1": 180,
+    "siirto_ruotsi_se3": 187,
+    "siirto_viro": 194
+}
+
+CACHE_FILE = "fingrid_full_model_cache.csv"
+CACHE_MAX_AGE_HOURS = 1
+
 nyt_utc = datetime.now(timezone.utc)
 alku_utc = nyt_utc - timedelta(days=14)
 
@@ -24,8 +39,24 @@ headers = {
     "Accept": "application/json"
 }
 
-def hae_fingrid_data(dataset_id):
-    """Haetaan data Fingridistä sivutuksella."""
+# --- 2. DATAN HAKUFUNKTIOT ---
+
+def lataa_oma_tuulivoimaennuste(tiedosto_polku):
+    """Lataa ja pyöristää oman tuulivoimaennusteen ajat tasatunneille."""
+    if os.path.exists(tiedosto_polku):
+        try:
+            df_tuuli = pd.read_csv(tiedosto_polku)
+            df_tuuli["aika_fi"] = pd.to_datetime(df_tuuli["aika_fi"], utc=True).dt.tz_convert("Europe/Helsinki").dt.floor("h")
+            print(f" Ladattu oma tuulivoimaennuste tiedostosta '{tiedosto_polku}' ({len(df_tuuli)} riviä).")
+            return df_tuuli.sort_values("aika_fi").reset_index(drop=True)
+        except Exception as e:
+            print(f" Virhe tuulivoimaennusteen luvussa: {e}")
+    else:
+        print(f" Varoitus: Tiedostoa '{tiedosto_polku}' ei löytynyt. Käytetään oletusarvoja.")
+    return pd.DataFrame()
+
+def hae_fingrid_dataset(dataset_id):
+    """Haetaan Fingrid-dataset sallitulla max-sivukoolla (1000)."""
     url = f"https://data.fingrid.fi/api/datasets/{dataset_id}/data"
     kaikki_data = []
     page = 1
@@ -37,34 +68,23 @@ def hae_fingrid_data(dataset_id):
             "pageSize": 1000,
             "page": page
         }
-        
         try:
-            response = requests.get(url, headers=headers, params=params, timeout=10)
-            
-            if response.status_code == 429:
-                print(" Odotetaan 3 sekuntia (API-rajoitus hit)...")
-                time.sleep(3)
+            res = requests.get(url, headers=headers, params=params, timeout=10)
+            if res.status_code == 429:
+                time.sleep(1.5)
                 continue
-                
-            response.raise_for_status()
-            
-            json_data = response.json()
-            sivun_data = json_data.get("data", [])
-            
-            if not sivun_data:
+            res.raise_for_status()
+            json_data = res.json()
+            sivu = json_data.get("data", [])
+            if not sivu:
                 break
-                
-            kaikki_data.extend(sivun_data)
-            
-            pagination = json_data.get("pagination", {})
-            if page >= pagination.get("lastPage", 1):
+            kaikki_data.extend(sivu)
+            if page >= json_data.get("pagination", {}).get("lastPage", 1):
                 break
-                
             page += 1
-            time.sleep(0.3)
-
+            time.sleep(0.02)
         except Exception as e:
-            print(f"\n Virhe datan haussa (Dataset {dataset_id}): {e}")
+            print(f" Virhe Fingrid datasetissä {dataset_id}: {e}")
             break
             
     if not kaikki_data:
@@ -72,126 +92,195 @@ def hae_fingrid_data(dataset_id):
         
     df = pd.DataFrame(kaikki_data)
     df["startTime"] = pd.to_datetime(df["startTime"])
-    df["aika_fi"] = df["startTime"].dt.tz_convert("Europe/Helsinki")
+    df["aika_fi"] = df["startTime"].dt.tz_convert("Europe/Helsinki").dt.floor("h")
     df = df.sort_values("aika_fi").reset_index(drop=True)
     return df[["aika_fi", "value"]]
 
-def hae_yhdistetty_data_cachella():
-    """Tarkistaa löytyykö kelvollinen välimuisti levyltä, muuten hakee APIsta."""
+def hae_lampotila_data():
+    """Haetaan lämpötila Open-Meteo APIsta."""
+    url = "https://api.open-meteo.com/v1/forecast"
+    params = {
+        "latitude": 62.0, "longitude": 25.0, "hourly": "temperature_2m",
+        "past_days": 14, "forecast_days": 3, "timezone": "Europe/Helsinki"
+    }
+    try:
+        res = requests.get(url, params=params, timeout=5)
+        if res.status_code == 200:
+            data = res.json()["hourly"]
+            aika_sarja = pd.to_datetime(data["time"])
+            aika_sarja = aika_sarja.tz_localize("Europe/Helsinki") if aika_sarja.tz is None else aika_sarja.tz_convert("Europe/Helsinki")
+            return pd.DataFrame({"aika_fi": aika_sarja.dt.floor("h"), "lampotila": data["temperature_2m"]})
+    except Exception:
+        pass
+    return pd.DataFrame()
+
+def hae_porssihinnat():
+    """Haetaan Suomen pörssisähkön hinnat."""
+    try:
+        res = requests.get("https://porssisahko.net/api/v1/latest.json", timeout=6)
+        if res.status_code == 200:
+            data = res.json().get("prices", [])
+            if data:
+                df = pd.DataFrame(data)
+                df["aika_fi"] = pd.to_datetime(df["startDate"]).dt.tz_convert("Europe/Helsinki").dt.floor("h")
+                df["hinta_cents"] = df["price"]
+                return df[["aika_fi", "hinta_cents"]]
+    except Exception:
+        pass
+
+    try:
+        res = requests.get("https://api.spot-hinta.fi/v1/TodayAndDayForward", timeout=6)
+        if res.status_code == 200:
+            df = pd.DataFrame(res.json())
+            if "DateTime" in df.columns and "PriceWithTax" in df.columns:
+                df["aika_fi"] = pd.to_datetime(df["DateTime"]).dt.tz_convert("Europe/Helsinki").dt.floor("h")
+                df["hinta_cents"] = df["PriceWithTax"] * 100
+                return df[["aika_fi", "hinta_cents"]]
+    except Exception:
+        pass
+
+    return pd.DataFrame()
+
+def hae_ja_yhdista_kaikki_data():
     if os.path.exists(CACHE_FILE):
         file_mod_time = datetime.fromtimestamp(os.path.getmtime(CACHE_FILE), tz=timezone.utc)
-        age = nyt_utc - file_mod_time
-        
-        if age < timedelta(hours=CACHE_MAX_AGE_HOURS):
-            print(f" Ladataan data paikallisesta välimuistista ('{CACHE_FILE}')...")
+        if (nyt_utc - file_mod_time) < timedelta(hours=CACHE_MAX_AGE_HOURS):
             df = pd.read_csv(CACHE_FILE)
-            # Muunnetaan merkkijono Aikavyöhykkeelliseksi datetime-olioksi (Europe/Helsinki)
-            df["aika_fi"] = pd.to_datetime(df["aika_fi"], utc=True).dt.tz_convert("Europe/Helsinki")
-            return df
+            df["aika_fi"] = pd.to_datetime(df["aika_fi"], utc=True).dt.tz_convert("Europe/Helsinki").dt.floor("h")
+            if "hinta_cents" in df.columns and "lampotila" in df.columns and "kulutus_toteutunut" in df.columns:
+                print(f" Ladataan yhdistetty data välimuistista ('{CACHE_FILE}')...")
+                return df
 
-    print(" Välimuistia ei löydy tai se on vanhentunut. Haetaan data Fingridistä...")
-    
-    print("1/2 Haetaan toteutunut kulutus (124)...")
-    df_toteutunut = hae_fingrid_data(DATASET_TOTEUTUNUT)
+    print(" Haetaan data kaikkialta rajapinnoista...")
+    yhdistetty_df = None
 
-    time.sleep(1.5)
+    for nimi, ds_id in DATASETS.items():
+        print(f"   -> Fingrid: {nimi}...")
+        df_temp = hae_fingrid_dataset(ds_id)
+        if not df_temp.empty:
+            df_temp = df_temp.rename(columns={"value": nimi})
+            yhdistetty_df = df_temp if yhdistetty_df is None else pd.merge_asof(yhdistetty_df, df_temp, on="aika_fi", direction="nearest")
 
-    print("2/2 Haetaan Fingridin ennuste (192)...")
-    df_fingrid_ennuste = hae_fingrid_data(DATASET_ENNUSTE)
-
-    if df_toteutunut.empty or df_fingrid_ennuste.empty:
+    if yhdistetty_df is None or yhdistetty_df.empty:
+        print(" Virhe: Fingrid-dataa ei saatu. Tarkista verkkoyhteys / API-avain.")
         return pd.DataFrame()
 
-    df = pd.merge_asof(
-        df_toteutunut.rename(columns={"value": "toteutunut_MW"}),
-        df_fingrid_ennuste.rename(columns={"value": "fingrid_ennuste_MW"}),
-        on="aika_fi",
-        direction="nearest"
-    ).dropna()
+    print("   -> Lämpötila (Open-Meteo)...")
+    df_w = hae_lampotila_data()
+    if not df_w.empty:
+        yhdistetty_df = pd.merge_asof(yhdistetty_df, df_w, on="aika_fi", direction="nearest")
+    else:
+        yhdistetty_df["lampotila"] = 10.0
 
-    # Tallennetaan välimuistiin
-    df.to_csv(CACHE_FILE, index=False)
-    print(f" Data tallennettu välimuistiin: '{CACHE_FILE}'")
-    return df
+    print("   -> Sähkön pörssihinnat...")
+    df_h = hae_porssihinnat()
+    if not df_h.empty:
+        yhdistetty_df = pd.merge_asof(yhdistetty_df, df_h, on="aika_fi", direction="nearest")
+    else:
+        print(" Varoitus: Pörssihinta-API ei vastannut. Käytetään laskennallista pohjaa...")
+        if "kulutus_toteutunut" in yhdistetty_df.columns and "tuulivoima_toteutunut" in yhdistetty_df.columns:
+            yhdistetty_df["hinta_cents"] = (yhdistetty_df["kulutus_toteutunut"] - yhdistetty_df["tuulivoima_toteutunut"]) * 0.001
+        else:
+            yhdistetty_df["hinta_cents"] = 5.0
 
-# --- PÄÄOHJELMA ---
-df = hae_yhdistetty_data_cachella()
+    yhdistetty_df = yhdistetty_df.dropna().reset_index(drop=True)
+    yhdistetty_df.to_csv(CACHE_FILE, index=False)
+    print(f" Data valmis ja tallennettu välimuistiin: '{CACHE_FILE}'")
+    return yhdistetty_df
 
-if df.empty:
-    print("\n Datan haku ei onnistunut. Yritä hetken kuluttua uudelleen.")
+# --- 3. PÄÄOHJELMA & DIRECT FORECASTING ---
+
+df_oma_tuuli = lataa_oma_tuulivoimaennuste(TUULIENNUSTE_TIEDOSTO)
+df = hae_ja_yhdista_kaikki_data()
+
+if df.empty or "hinta_cents" not in df.columns or "lampotila" not in df.columns:
+    print("\n Datan haku epäonnistui. Poista 'fingrid_full_model_cache.csv' ja suorita uudelleen.")
 else:
-    # Luodaan piirteet
     df["tunti"] = df["aika_fi"].dt.hour
     df["viikonpaiva"] = df["aika_fi"].dt.dayofweek
     df["kuukausi"] = df["aika_fi"].dt.month
-    df["lag_1h"] = df["toteutunut_MW"].shift(1)
-    df["lag_24h"] = df["toteutunut_MW"].shift(24)
+    df["on_viikonloppu"] = df["viikonpaiva"].apply(lambda x: 1 if x >= 5 else 0)
+    df["huipputunti"] = df["tunti"].apply(lambda t: 1 if 7 <= t <= 20 else 0)
+
+    df["jaannoskuorma_MW"] = df["kulutus_toteutunut"] - (df["tuulivoima_toteutunut"] + df["aurinkovoima_ennuste"])
+    df["tuuli_osuus"] = df["tuulivoima_toteutunut"] / (df["kulutus_toteutunut"] + 1e-5)
+    df["nettosiirto_yhteensa"] = df["siirto_ruotsi_se1"] + df["siirto_ruotsi_se3"] + df["siirto_viro"]
+
+    feature_cols = [
+        "tunti", "viikonpaiva", "kuukausi", "on_viikonloppu", "huipputunti",
+        "lampotila", "kulutus_ennuste", "tuulivoima_ennuste", "aurinkovoima_ennuste",
+        "ydinvoima_toteutunut", "vesivoima_toteutunut", "yhteistuotanto_chp",
+        "teholauhdutus_varavoima", "jaannoskuorma_MW", "tuuli_osuus",
+        "nettosiirto_yhteensa", "hinta_cents"
+    ]
+
+    # Luodaan 24 kohdesaraketta
+    for h in range(1, 25):
+        df[f"target_{h}h"] = df["hinta_cents"].shift(-h)
 
     df_clean = df.dropna().copy()
+    X = df_clean[feature_cols]
 
-    features = ["tunti", "viikonpaiva", "kuukausi", "lag_1h", "lag_24h"]
-    X = df_clean[features]
-    y = df_clean["toteutunut_MW"]
+    viimeisin = df_clean.iloc[-1]
+    viimeisin_aika_tunti = viimeisin["aika_fi"].floor("h")
 
-    # Koulutus- ja testijako
-    split_idx = int(len(df_clean) * 0.8)
-    X_train, X_test = X.iloc[:split_idx], X.iloc[split_idx:]
-    y_train, y_test = y.iloc[:split_idx], y.iloc[split_idx:]
+    print("\n" + "="*65)
+    print(f" SÄHKÖN PÖRSSIHINNAN DIRECT-ENNUSTE SEURAAVALLE 24 TUNNILLE")
+    print(" (Käytetään omaa tuulivoimaennustetta ja Direct LightGBM -malleja)")
+    print("="*65)
 
-    malli = LGBMRegressor(n_estimators=100, learning_rate=0.05, random_state=42, verbosity=-1)
-    malli.fit(X_train, y_train)
+    tuntikohtainen_kulutuskerroin = {
+        0: 0.80, 1: 0.75, 2: 0.72, 3: 0.70, 4: 0.72, 5: 0.78,
+        6: 0.88, 7: 1.02, 8: 1.10, 9: 1.12, 10: 1.08, 11: 1.05,
+        12: 1.00, 13: 0.98, 14: 1.02, 15: 1.08, 16: 1.18, 17: 1.28,
+        18: 1.35, 19: 1.32, 20: 1.20, 21: 1.05, 22: 0.92, 23: 0.85
+    }
 
-    test_ennusteet = malli.predict(X_test)
-    mae = mean_absolute_error(y_test, test_ennusteet)
-
-    viimeisin_rivi = df_clean.iloc[-1]
-    nykyinen_aika = viimeisin_rivi["aika_fi"].strftime("%d.%m.%Y %H:%M")
-
-    toteutunut_nykyhetki = viimeisin_rivi["toteutunut_MW"]
-    fingrid_ennuste_nykyhetki = viimeisin_rivi["fingrid_ennuste_MW"]
-
-    uusi_syote = pd.DataFrame([viimeisin_rivi[features].to_dict()])
-    oma_lgbm_ennuste = malli.predict(uusi_syote)[0]
-
-    # --- SÄILYTETYT TULOSTEET ---
-    print("\n" + "="*50)
-    print(f"SÄHKÖNKULUTUSENNUSTE AJANKOHDALLE: {nykyinen_aika}")
-    print("="*50)
-    print(f"1. Toteutunut kulutus (Fingrid): {toteutunut_nykyhetki:.2f} MW")
-    print(f"2. Sinun LightGBM-ennusteesi:     {oma_lgbm_ennuste:.2f} MW")
-    print(f"3. Fingridin virallinen ennuste: {fingrid_ennuste_nykyhetki:.2f} MW")
-    print("-" * 50)
-    print(f"Sinun mallisi virhe tässä pisteessä:  {abs(toteutunut_nykyhetki - oma_lgbm_ennuste):.2f} MW")
-    print(f"Fingridin ennusteen virhe pisteessä: {abs(toteutunut_nykyhetki - fingrid_ennuste_nykyhetki):.2f} MW")
-    print(f"\nMallisi keskimääräinen virhe (MAE testijoukossa): {mae:.2f} MW")
-    print("="*50)
-
-    # --- ENNUSTE 24 TUNNILLE ETEENPÄIN ---
-    viimeisin_aika = viimeisin_rivi["aika_fi"]
-    nykyinen_lag1 = toteutunut_nykyhetki
-
-    print("\n" + "="*50)
-    print(f"ENNUSTE SEURAAVALLE 24 TUNNILLE (Alkaen {viimeisin_aika.strftime('%d.%m.%Y %H:%M')})")
-    print("="*50)
-
-    for i in range(1, 25):
-        tuleva_aika = viimeisin_aika + timedelta(hours=i)
+    for h in range(1, 25):
+        tuleva_aika = (viimeisin_aika_tunti + timedelta(hours=h)).floor("h")
+        tunti = tuleva_aika.hour
         
-        # Haetaan lag_24h historiasta
-        lag_24h_arvo = df_clean[df_clean["aika_fi"] == (tuleva_aika - timedelta(hours=24))]["toteutunut_MW"]
-        lag_24h_val = lag_24h_arvo.values[0] if not lag_24h_arvo.empty else nykyinen_lag1
+        # 1. Tuleva kulutus
+        kerroin = tuntikohtainen_kulutuskerroin[tunti]
+        tuleva_kulutus = viimeisin["kulutus_ennuste"] * kerroin
         
-        syote = pd.DataFrame([{
-            "tunti": tuleva_aika.hour,
+        # 2. Oma tuuli-ennuste CSV:stä
+        tuleva_tuuli = 2500.0
+        if not df_oma_tuuli.empty:
+            match = df_oma_tuuli[df_oma_tuuli["aika_fi"] == tuleva_aika]
+            if not match.empty and "oma_lgbm_ennuste_MW" in match.columns:
+                tuleva_tuuli = match["oma_lgbm_ennuste_MW"].values[0]
+
+        tuleva_aurinko = viimeisin["aurinkovoima_ennuste"] if 8 <= tunti <= 17 else 0.0
+
+        syote_h = pd.DataFrame([{
+            "tunti": tunti,
             "viikonpaiva": tuleva_aika.dayofweek,
             "kuukausi": tuleva_aika.month,
-            "lag_1h": nykyinen_lag1,
-            "lag_24h": lag_24h_val
+            "on_viikonloppu": 1 if tuleva_aika.dayofweek >= 5 else 0,
+            "huipputunti": 1 if 7 <= tunti <= 20 else 0,
+            "lampotila": viimeisin["lampotila"],
+            "kulutus_ennuste": tuleva_kulutus,
+            "tuulivoima_ennuste": tuleva_tuuli,
+            "aurinkovoima_ennuste": tuleva_aurinko,
+            "ydinvoima_toteutunut": viimeisin["ydinvoima_toteutunut"],
+            "vesivoima_toteutunut": viimeisin["vesivoima_toteutunut"],
+            "yhteistuotanto_chp": viimeisin["yhteistuotanto_chp"],
+            "teholauhdutus_varavoima": viimeisin["teholauhdutus_varavoima"],
+            "jaannoskuorma_MW": tuleva_kulutus - (tuleva_tuuli + tuleva_aurinko),
+            "tuuli_osuus": tuleva_tuuli / (tuleva_kulutus + 1e-5),
+            "nettosiirto_yhteensa": viimeisin["nettosiirto_yhteensa"],
+            "hinta_cents": viimeisin["hinta_cents"]
         }])
-        
-        ennustettu_mw = malli.predict(syote)[0]
-        nykyinen_lag1 = ennustettu_mw
-        
-        print(f"{tuleva_aika.strftime('%d.%m. %H:%M')}  -->  {ennustettu_mw:.2f} MW")
 
-    print("="*50)
+        # Koulutetaan nopea Direct-malli tunnille h
+        y_h = df_clean[f"target_{h}h"]
+        malli_h = LGBMRegressor(n_estimators=100, learning_rate=0.05, random_state=42, verbosity=-1)
+        malli_h.fit(X, y_h)
+
+        ennustettu_hinta = malli_h.predict(syote_h)[0]
+
+        taso = "HALPA" if ennustettu_hinta < 5.0 else ("KOHTUULLINEN" if ennustettu_hinta < 10.0 else "KALLIS")
+        print(f"{tuleva_aika.strftime('%d.%m. %H:%M')} (+{h:2d}h) -->  {ennustettu_hinta:6.2f} c/kWh   [{taso}]  (Tuuli: {tuleva_tuuli:.0f} MW)")
+
+    print("="*65)
